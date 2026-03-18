@@ -955,6 +955,33 @@ By Sam`;
 
             // --- SECURITY INTERCEPTORS ---
             if (isGroup && !isFromMe && !isAdmin) {
+                // 2. Anti Link & Auto Kick
+                if (config.antilink?.includes(msg.key.remoteJid)) {
+                    const linkRegex = /((https?:\/\/)?(www\.)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(\/[^\s]*)?|wa\.me\/[^\s]+|chat\.whatsapp\.com\/[^\s]+|t\.me\/[^\s]+)/gi;
+                    if (linkRegex.test(text)) {
+                        try {
+                            await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
+                        } catch (e) {}
+                        
+                        const warningKey = `${msg.key.remoteJid}_${sender}`;
+                        const currentWarnings = (userWarnings.get(warningKey) || 0) + 1;
+                        userWarnings.set(warningKey, currentWarnings);
+
+                        if (currentWarnings >= 3 || config.autokick?.includes(msg.key.remoteJid)) {
+                            try {
+                                await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
+                                await reply(`⚠️ @${sender.split('@')[0]} a été banni pour avoir envoyé des liens (3/3 avertissements) !`, null, { mentions: [sender] });
+                                userWarnings.delete(warningKey);
+                            } catch (e) {
+                                await reply(`❌ Impossible de bannir @${sender.split('@')[0]}. Je n'ai probablement pas les droits d'administrateur.`, null, { mentions: [sender] });
+                            }
+                        } else {
+                            await reply(`⚠️ @${sender.split('@')[0]}, les liens sont interdits ! Avertissement ${currentWarnings}/3. Au 3ème, tu seras banni.`, null, { mentions: [sender] });
+                        }
+                        return;
+                    }
+                }
+
                 // 0. Anti Spam
                 if (config.antispam?.includes(msg.key.remoteJid)) {
                     const now = Date.now();
