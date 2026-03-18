@@ -1,0 +1,5 @@
+{
+  "name": "Remix: Vortex-MD WhatsApp Bot Panel",
+  "description": "A modern web panel to connect your WhatsApp account to the Vortex-MD bot using Baileys pairing code.",
+  "requestFramePermissions": ["camera"]
+}
