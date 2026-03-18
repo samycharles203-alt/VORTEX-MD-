@@ -9,7 +9,7 @@ function cn(...inputs: ClassValue[]) {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'pairing' | 'settings' | 'about' | 'qr-pairing'>('pairing');
+  const [activeTab, setActiveTab] = useState<'pairing' | 'settings' | 'about' | 'qr-pairing' | 'chat'>('pairing');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [prefix, setPrefix] = useState('.');
   const [autoReact, setAutoReact] = useState(false);
@@ -23,6 +23,16 @@ export default function App() {
   const [showForce, setShowForce] = useState(false);
   const [connectedCount, setConnectedCount] = useState<number | null>(null);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+
+  // Web Chat State
+  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'bot', text: string }[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages]);
 
   useEffect(() => {
     const fetchStats = async () => {
@@ -140,6 +150,34 @@ export default function App() {
     }
   };
 
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim() || isChatLoading) return;
+
+    const userMsg = chatInput.trim();
+    setChatMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+    setChatInput('');
+    setIsChatLoading(true);
+
+    try {
+      const res = await fetch('/api/web-chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMsg }),
+      });
+      const data = await res.json();
+      if (data.text) {
+        setChatMessages(prev => [...prev, { role: 'bot', text: data.text }]);
+      } else {
+        throw new Error(data.error || 'Failed to get response');
+      }
+    } catch (err: any) {
+      setChatMessages(prev => [...prev, { role: 'bot', text: `❌ Error: ${err.message}` }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-white flex flex-col font-sans text-blue-900 selection:bg-blue-100">
       {/* Top Menu Bar */}
@@ -192,6 +230,15 @@ export default function App() {
                 )}
               >
                 <Smartphone className="w-5 h-5" /> Pairing
+              </button>
+              <button 
+                onClick={() => { setActiveTab('chat'); setIsMenuOpen(false); }}
+                className={cn(
+                  "w-full flex items-center gap-3 p-3 rounded-xl font-semibold transition-all",
+                  activeTab === 'chat' ? "bg-blue-50 text-blue-600" : "text-blue-400 hover:bg-blue-50 hover:text-blue-600"
+                )}
+              >
+                <Zap className="w-5 h-5" /> Web Chat
               </button>
               <button 
                 onClick={() => { setActiveTab('qr-pairing'); setIsMenuOpen(false); }}
@@ -406,6 +453,70 @@ export default function App() {
           </>
         )}
 
+        {activeTab === 'chat' && (
+          <div className="flex flex-col h-[calc(100vh-180px)] max-h-[700px] animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="text-center space-y-2 pt-4 mb-6">
+              <h2 className="text-3xl font-extrabold text-blue-900 tracking-tight">Web Chat</h2>
+              <p className="text-blue-400 font-medium">Talk to the AI directly from the web.</p>
+            </div>
+            
+            <div className="flex-1 bg-white rounded-[2.5rem] border border-blue-50 shadow-2xl shadow-blue-100/50 flex flex-col overflow-hidden">
+              {/* Messages Area */}
+              <div className="flex-1 overflow-y-auto p-6 space-y-4 scrollbar-thin scrollbar-thumb-blue-100">
+                {chatMessages.length === 0 && (
+                  <div className="h-full flex flex-col items-center justify-center text-center space-y-4 opacity-40">
+                    <Bot className="w-16 h-16 text-blue-200" />
+                    <p className="font-bold text-blue-300 uppercase tracking-widest text-xs">No messages yet. Say hello!</p>
+                  </div>
+                )}
+                {chatMessages.map((msg, i) => (
+                  <div key={i} className={cn(
+                    "flex flex-col max-w-[85%]",
+                    msg.role === 'user' ? "ml-auto items-end" : "mr-auto items-start"
+                  )}>
+                    <div className={cn(
+                      "px-5 py-3 rounded-2xl text-sm font-medium leading-relaxed",
+                      msg.role === 'user' 
+                        ? "bg-blue-600 text-white rounded-tr-none shadow-lg shadow-blue-100" 
+                        : "bg-blue-50 text-blue-900 rounded-tl-none border border-blue-100"
+                    )}>
+                      {msg.text}
+                    </div>
+                  </div>
+                ))}
+                {isChatLoading && (
+                  <div className="mr-auto items-start flex flex-col max-w-[85%]">
+                    <div className="bg-blue-50 text-blue-900 px-5 py-3 rounded-2xl rounded-tl-none border border-blue-100 flex gap-1">
+                      <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce" />
+                      <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce [animation-delay:0.2s]" />
+                      <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-bounce [animation-delay:0.4s]" />
+                    </div>
+                  </div>
+                )}
+                <div ref={chatEndRef} />
+              </div>
+
+              {/* Input Area */}
+              <form onSubmit={handleSendMessage} className="p-4 bg-blue-50/30 border-t border-blue-50 flex gap-3">
+                <input
+                  type="text"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Type your message..."
+                  className="flex-1 bg-white border border-blue-100 rounded-2xl py-3 px-5 text-blue-900 font-medium focus:outline-none focus:ring-4 focus:ring-blue-100 transition-all shadow-sm"
+                  disabled={isChatLoading}
+                />
+                <button
+                  type="submit"
+                  disabled={isChatLoading || !chatInput.trim()}
+                  className="bg-blue-600 text-white p-3 rounded-2xl shadow-lg shadow-blue-100 hover:scale-105 active:scale-95 disabled:opacity-50 transition-all"
+                >
+                  <Zap className="w-6 h-6" />
+                </button>
+              </form>
+            </div>
+          </div>
+        )}
         {activeTab === 'settings' && (
           <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="text-center space-y-2 pt-4">

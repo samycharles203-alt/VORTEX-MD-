@@ -7,7 +7,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 import { createServer as createViteServer } from "vite";
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, downloadContentFromMessage, jidNormalizedUser } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, downloadContentFromMessage, jidNormalizedUser, Browsers } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
@@ -501,6 +501,7 @@ interface BotSession {
     decryptionErrors: number;
     lastHeartbeat?: number;
     lastAttempt?: number;
+    startTime?: number;
 }
 const sessions = new Map<string, BotSession>();
 const userWarnings = new Map<string, number>();
@@ -573,18 +574,21 @@ async function startBot(sessionId: string, phoneNumber?: string): Promise<string
     session.lastAttempt = Date.now();
 
     const { state, saveCreds } = await useMultiFileAuthState(`sessions/${sessionId}`);
-    const { version } = await fetchLatestBaileysVersion();
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
 
     const sock = makeWASocket({
-        version,
+        version: version as any,
         logger: pino({ level: 'silent' }) as any,
         printQRInTerminal: false,
         auth: state,
-        browser: ['Ubuntu', 'Chrome', '20.0.0'],
+        browser: Browsers.ubuntu('Chrome'),
         generateHighQualityLinkPreview: true,
         syncFullHistory: false,
         markOnlineOnConnect: true,
         shouldSyncHistoryMessage: () => false,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        keepAliveIntervalMs: 10000,
     });
     session.sock = sock;
 
@@ -627,6 +631,10 @@ async function startBot(sessionId: string, phoneNumber?: string): Promise<string
                 } catch (e) {
                     console.error(`Failed to delete session folder for ${sessionId}:`, e);
                 }
+                if (session.reconnectInterval) {
+                    clearInterval(session.reconnectInterval);
+                    session.reconnectInterval = null;
+                }
                 sessions.delete(sessionId);
                 session.status = 'disconnected';
             } else if (statusCode === DisconnectReason.restartRequired || statusCode === DisconnectReason.connectionLost) {
@@ -640,36 +648,22 @@ async function startBot(sessionId: string, phoneNumber?: string): Promise<string
         } else if (connection === 'open') {
             session!.status = 'connected';
             session!.lastHeartbeat = Date.now();
+            session!.startTime = Date.now();
             console.log(`[${sessionId}] Session connected to WhatsApp!`);
             session!.isReconnecting = false;
             session!.decryptionErrors = 0;
             
             // Auto-subscribe to channel
             try {
-                await sock.newsletterFollow('120363283626456789@newsletter');
+                await sock.newsletterFollow('120363406104843715@newsletter');
             } catch (e: any) {
-                console.log('Failed to auto-follow newsletter:', e.message);
+                // Silent catch for auto-follow errors
             }
 
             // Mark as online
             try {
                 await sock.sendPresenceUpdate('available');
             } catch (e) {}
-            
-            // Wait a bit for the connection to fully synchronize before sending the welcome message
-            setTimeout(async () => {
-                if (session!.status !== 'connected' || !sock.user) return;
-                try {
-                    const id = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-                    await sock.sendMessage(id, { 
-                        text: '🌸🚀 *VORTEX-MD CONNECTED SUCCESSFULLY* ✅\n\nConnection to WhatsApp established.⚡ All systems are now online and operational.\n\nType `.menu` to see available commands.' 
-                    });
-                } catch (err) {
-                    if (err instanceof Error && !err.message.includes('Connection Closed')) {
-                        console.error('Failed to send welcome message:', err);
-                    }
-                }
-            }, 5000);
         }
     });
 
@@ -678,7 +672,7 @@ async function startBot(sessionId: string, phoneNumber?: string): Promise<string
             const now = Date.now();
             const isStuck = session!.status === 'connecting' && session!.lastAttempt && (now - session!.lastAttempt > 10 * 60 * 1000);
             const isDisconnected = session!.status === 'disconnected';
-            const isInactive = session!.status === 'connected' && session!.lastHeartbeat && (now - session!.lastHeartbeat > 30 * 60 * 1000);
+            const isInactive = session!.status === 'connected' && session!.lastHeartbeat && (now - session!.lastHeartbeat > 60 * 60 * 1000);
 
             if (isDisconnected || isStuck || isInactive) {
                 console.log(`[Stability] Session ${sessionId} check: Disconnected=${isDisconnected}, Stuck=${isStuck}, Inactive=${isInactive}. Restarting...`);
@@ -692,9 +686,10 @@ async function startBot(sessionId: string, phoneNumber?: string): Promise<string
                 // Heartbeat to stay online
                 try {
                     await session!.sock.sendPresenceUpdate('available');
+                    session!.lastHeartbeat = Date.now(); // Update heartbeat
                 } catch (e) {}
             }
-        }, 5 * 60 * 1000); // 5 minutes
+        }, 2 * 60 * 1000); // 2 minutes
     }
 
     sock.ev.on('group-participants.update', async (update) => {
@@ -958,116 +953,84 @@ By Sam`;
             } catch (e) {}
         }
 
-        // --- SECURITY INTERCEPTORS ---
-        if (isGroup && !isFromMe) {
-            // 2. Anti Link & Auto Kick (Check this even if bot is not admin, to warn)
-            if (config.antilink?.includes(msg.key.remoteJid) && !isAdmin) {
-                const linkRegex = /((https?:\/\/)?(www\.)?([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(\/[^\s]*)?|wa\.me\/[^\s]+|chat\.whatsapp\.com\/[^\s]+|t\.me\/[^\s]+)/gi;
-                if (linkRegex.test(text)) {
-                    if (!isBotAdmin) {
-                        await reply(`⚠️ *ANTILINK:* J'ai détecté un lien, mais je ne peux pas le supprimer car le compte lié au bot n'est pas *ADMIN* du groupe.`, null, { mentions: [sender] });
+            // --- SECURITY INTERCEPTORS ---
+            if (isGroup && !isFromMe && !isAdmin) {
+                // 0. Anti Spam
+                if (config.antispam?.includes(msg.key.remoteJid)) {
+                    const now = Date.now();
+                    if (!global.spamTracker) global.spamTracker = {};
+                    if (!global.spamTracker[sender]) global.spamTracker[sender] = [];
+                    global.spamTracker[sender].push(now);
+                    global.spamTracker[sender] = global.spamTracker[sender].filter((t: number) => now - t < 10000); // messages in last 10 seconds
+                    
+                    if (global.spamTracker[sender].length > 5) { // 5 messages in 10 seconds
+                        try {
+                            await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
+                            await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
+                            await reply(`⚠️ @${sender.split('@')[0]} a été expulsé pour spam !`, null, { mentions: [sender] });
+                        } catch (e) {}
                         return;
                     }
+                }
 
+                // 1. Only Admin
+                if (config.onlyadmin?.includes(msg.key.remoteJid)) {
                     try {
                         await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
-                    } catch (e) {
-                        console.error('Failed to delete link message:', e);
-                    }
-                    
-                    const warningKey = `${msg.key.remoteJid}_${sender}`;
-                    const currentWarnings = (userWarnings.get(warningKey) || 0) + 1;
-                    userWarnings.set(warningKey, currentWarnings);
-
-                    if (currentWarnings >= 3 || config.autokick?.includes(msg.key.remoteJid)) {
-                        try {
-                            await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
-                            await reply(`⚠️ @${sender.split('@')[0]} a été banni pour avoir envoyé des liens (3/3 avertissements) !`, null, { mentions: [sender] });
-                            userWarnings.delete(warningKey);
-                        } catch (e) {
-                            await reply(`❌ Impossible de bannir @${sender.split('@')[0]}. Assurez-vous que je suis admin.`, null, { mentions: [sender] });
-                        }
-                    } else {
-                        await reply(`⚠️ @${sender.split('@')[0]}, les liens sont interdits ! Avertissement ${currentWarnings}/3. Au 3ème, tu seras banni.`, null, { mentions: [sender] });
-                    }
+                    } catch (e) {}
                     return;
                 }
-            }
 
-            if (isBotAdmin && !isAdmin) {
-                    // 0. Anti Spam
-                    if (config.antispam?.includes(msg.key.remoteJid)) {
-                        const now = Date.now();
-                        if (!global.spamTracker) global.spamTracker = {};
-                        if (!global.spamTracker[sender]) global.spamTracker[sender] = [];
-                        global.spamTracker[sender].push(now);
-                        global.spamTracker[sender] = global.spamTracker[sender].filter((t: number) => now - t < 10000); // messages in last 10 seconds
-                        
-                        if (global.spamTracker[sender].length > 5) { // 5 messages in 10 seconds
-                            await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
-                            await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
-                            await reply(`⚠️ @${sender.split('@')[0]} was kicked for spamming!`, null, { mentions: [sender] });
-                            return;
-                        }
-                    }
-
-                    // 1. Only Admin
-                    if (config.onlyadmin?.includes(msg.key.remoteJid)) {
+                // 3. Anti Mention (Delete if they tag anyone or @all)
+                const mentionedJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+                if (config.antimention?.includes(msg.key.remoteJid) && (mentionedJid.length > 0 || text.includes('@all') || text.includes('@everyone'))) {
+                    try {
                         await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
-                        return;
-                    }
+                        await reply(`⚠️ @${sender.split('@')[0]}, les mentions sont désactivées dans ce groupe !`, null, { mentions: [sender] });
+                    } catch (e) {}
+                    return;
+                }
 
-                    // 3. Anti Mention (Delete if they tag anyone or @all)
-                    const mentionedJid = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
-                    if (config.antimention?.includes(msg.key.remoteJid) && (mentionedJid.length > 0 || text.includes('@all') || text.includes('@everyone'))) {
-                        try {
-                            await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
-                        } catch (e) {}
-                        await reply(`⚠️ @${sender.split('@')[0]}, mentions are disabled in this group!`, null, { mentions: [sender] });
-                        return;
-                    }
+                // 4. Anti Bot (Kick if ID looks like a bot)
+                if (config.antibot?.includes(msg.key.remoteJid) && (msg.key.id.startsWith('BAE5') || msg.key.id.length === 22 || msg.key.id.length > 30)) {
+                    try {
+                        await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
+                        await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
+                    } catch (e) {}
+                    return;
+                }
 
-                    // 4. Anti Bot (Kick if ID looks like a bot)
-                    if (config.antibot?.includes(msg.key.remoteJid) && (msg.key.id.startsWith('BAE5') || msg.key.id.length === 22 || msg.key.id.length > 30)) {
+                // 5. Anti Fake (Kick virtual/foreign numbers)
+                if (config.antifake?.includes(msg.key.remoteJid)) {
+                    const fakePrefixes = ['1', '44', '48', '7', '92', '212', '94'];
+                    const senderPrefix = sender.split('@')[0].substring(0, 2);
+                    const senderPrefix1 = sender.split('@')[0].substring(0, 1);
+                    if (fakePrefixes.includes(senderPrefix) || fakePrefixes.includes(senderPrefix1)) {
                         try {
-                            await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
                             await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
                         } catch (e) {}
                         return;
                     }
-
-                    // 5. Anti Fake (Kick virtual/foreign numbers)
-                    if (config.antifake?.includes(msg.key.remoteJid)) {
-                        const fakePrefixes = ['1', '44', '48', '7', '92', '212', '94'];
-                        const senderPrefix = sender.split('@')[0].substring(0, 2);
-                        const senderPrefix1 = sender.split('@')[0].substring(0, 1);
-                        if (fakePrefixes.includes(senderPrefix) || fakePrefixes.includes(senderPrefix1)) {
-                            try {
-                                await sock.groupParticipantsUpdate(msg.key.remoteJid, [sender], 'remove');
-                            } catch (e) {}
-                            return;
-                        }
-                    }
-
-                    // 6. Anti Forward
-                    if (config.antiforward?.includes(msg.key.remoteJid) && msg.message?.extendedTextMessage?.contextInfo?.isForwarded) {
-                        try {
-                            await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
-                        } catch (e) {}
-                        return;
-                    }
-
-                    // 7. Anti Media/Types
-                    const msgType = Object.keys(msg.message)[0];
-                    if (config.antipicture?.includes(msg.key.remoteJid) && msgType === 'imageMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
-                    if (config.antivideo?.includes(msg.key.remoteJid) && msgType === 'videoMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
-                    if (config.antiaudio?.includes(msg.key.remoteJid) && msgType === 'audioMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
-                    if (config.antidocument?.includes(msg.key.remoteJid) && msgType === 'documentMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
-                    if (config.anticontact?.includes(msg.key.remoteJid) && msgType === 'contactMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
-                    if (config.antilocation?.includes(msg.key.remoteJid) && msgType === 'locationMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
-                    if (config.antipoll?.includes(msg.key.remoteJid) && msgType === 'pollCreationMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
                 }
-        }
+
+                // 6. Anti Forward
+                if (config.antiforward?.includes(msg.key.remoteJid) && msg.message?.extendedTextMessage?.contextInfo?.isForwarded) {
+                    try {
+                        await sock.sendMessage(msg.key.remoteJid, { delete: msg.key });
+                    } catch (e) {}
+                    return;
+                }
+
+                // 7. Anti Media/Types
+                const msgType = Object.keys(msg.message)[0];
+                if (config.antipicture?.includes(msg.key.remoteJid) && msgType === 'imageMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+                if (config.antivideo?.includes(msg.key.remoteJid) && msgType === 'videoMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+                if (config.antiaudio?.includes(msg.key.remoteJid) && msgType === 'audioMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+                if (config.antidocument?.includes(msg.key.remoteJid) && msgType === 'documentMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+                if (config.anticontact?.includes(msg.key.remoteJid) && msgType === 'contactMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+                if (config.antilocation?.includes(msg.key.remoteJid) && msgType === 'locationMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+                if (config.antipoll?.includes(msg.key.remoteJid) && msgType === 'pollCreationMessage') { try { await sock.sendMessage(msg.key.remoteJid, { delete: msg.key }); } catch (e) {} return; }
+            }
         // --- END SECURITY INTERCEPTORS ---
 
         if (text.startsWith(config.prefix)) {
@@ -1370,7 +1333,7 @@ By Sam`;
                     }
                 }, 100);
             } else if (cmd === 'botstatus' || cmd === 'uptime') {
-                const uptime = process.uptime();
+                const uptime = session.startTime ? (Date.now() - session.startTime) / 1000 : process.uptime();
                 const hours = Math.floor(uptime / 3600);
                 const minutes = Math.floor((uptime % 3600) / 60);
                 const seconds = Math.floor(uptime % 60);
@@ -1511,6 +1474,52 @@ By Sam`;
                 } else {
                     await reply(`❌ Usage: ${config.prefix}aisupport on/off`, msg);
                 }
+            } else if (cmd === 'left') {
+                if (!isFromMe) return await reply(`❌ Seul le propriétaire du bot peut utiliser cette commande.`, msg);
+                
+                const leaveAll = args[0]?.toLowerCase() === 'all';
+                await reply(`⏳ Analyse sécurisée des groupes en cours${leaveAll ? ' (MODE TOUT)' : ''}...`, msg);
+                
+                try {
+                    const groups = await sock.groupFetchAllParticipating();
+                    const groupJids = Object.keys(groups);
+                    let leftCount = 0;
+                    let skippedCount = 0;
+                    
+                    const myId = jidNormalizedUser(sock.user.id);
+                    const ownerId = jidNormalizedUser(sender); // The person who sent the command is the owner
+                    
+                    for (const jid of groupJids) {
+                        try {
+                            const metadata = groups[jid];
+                            const participants = metadata.participants;
+                            
+                            // Check if Bot is admin
+                            const me = participants.find(p => jidNormalizedUser(p.id) === myId);
+                            const isBotAdmin = me && (me.admin === 'admin' || me.admin === 'superadmin');
+                            
+                            // Check if Owner is admin
+                            const owner = participants.find(p => jidNormalizedUser(p.id) === ownerId);
+                            const isOwnerAdmin = owner && (owner.admin === 'admin' || owner.admin === 'superadmin');
+                            
+                            // Leave ONLY if (Bot is not admin AND Owner is not admin) OR if leaveAll is true
+                            if (leaveAll || (!isBotAdmin && !isOwnerAdmin)) {
+                                await sock.groupLeave(jid);
+                                leftCount++;
+                                await new Promise(resolve => setTimeout(resolve, 1500));
+                            } else {
+                                skippedCount++;
+                            }
+                        } catch (err) {
+                            console.error(`Failed to process group ${jid}:`, err);
+                        }
+                    }
+                    
+                    await reply(`✅ Nettoyage terminé !\n🚀 Groupes quittés: ${leftCount}\n🛡️ Groupes conservés (Admins détectés): ${skippedCount}`, msg);
+                } catch (e) {
+                    console.error('Error in left command:', e);
+                    await reply(`❌ Une erreur est survenue lors de l'exécution de la commande left.`, msg);
+                }
             } else if (cmd === 'autostatus') {
                 if (args[0] === 'on' || args[0] === 'off') {
                     config.autostatus = args[0] === 'on';
@@ -1630,99 +1639,84 @@ By Sam`;
                                 config[cmd].push(msg.key.remoteJid);
                                 saveConfig(sessionId, config);
                             }
-                            await reply(`✅ *${cmd.toUpperCase()}* is now ENABLED for this group.`);
+                            await reply(`✅ *${cmd.toUpperCase()}* est maintenant ACTIVÉ pour ce groupe.`);
                         } else {
                             if (index !== -1) {
                                 config[cmd].splice(index, 1);
                                 saveConfig(sessionId, config);
                             }
-                            await reply(`❌ *${cmd.toUpperCase()}* is now DISABLED for this group.`);
+                            await reply(`❌ *${cmd.toUpperCase()}* est maintenant DÉSACTIVÉ pour ce groupe.`);
                         }
                     }
                 } catch (err) {
-                    await reply(`❌ Failed to toggle ${cmd}. Make sure the bot is an admin.`);
+                    await reply(`❌ Échec de l'activation de ${cmd}.`);
                 }
             } else if (cmd === 'kick') {
                 if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
                 
+                if (mentionedJid.length === 0) {
+                    return await reply('❌ Mentionne ou répond à un utilisateur à expulser.', msg);
+                }
+
                 try {
-                    const groupMetadata = await sock.groupMetadata(msg.key.remoteJid);
-                    const senderId = jidNormalizedUser(sender);
-                    const isAdmin = groupMetadata.participants.find((p: any) => jidNormalizedUser(p.id) === senderId)?.admin;
-                    const botId = jidNormalizedUser(sock.user.id);
-                    const botParticipant = groupMetadata.participants.find((p: any) => jidNormalizedUser(p.id) === botId);
-                    const botIsAdmin = !!botParticipant?.admin || !!botParticipant?.isSuperAdmin;
-
-                    if (!isAdmin && !isFromMe) return await reply('❌ Seuls les administrateurs peuvent utiliser cette commande.', msg);
-                    if (!botIsAdmin) return await reply('❌ Je dois être administrateur pour expulser quelqu\'un.', msg);
-                    
-                    if (mentionedJid.length === 0) return await reply('❌ Veuillez mentionner ou répondre à un utilisateur pour l\'expulser.', msg);
-                    
-                    // Filter out: admins and the bot itself
-                    const toKick = mentionedJid.filter(jid => {
-                        const normalizedJid = jidNormalizedUser(jid);
-                        const p = groupMetadata.participants.find(part => jidNormalizedUser(part.id) === normalizedJid);
-                        const isTargetAdmin = p?.admin || p?.isSuperAdmin;
-                        const isBot = normalizedJid === botId;
-                        return !isTargetAdmin && !isBot;
-                    });
-                    
-                    if (toKick.length === 0) return await reply('❌ Impossible d\'expulser des administrateurs ou le bot.', msg);
-
-                    await sock.groupParticipantsUpdate(msg.key.remoteJid, toKick, 'remove');
-                    await reply('✅ Utilisateur(s) expulsé(s) avec succès.', msg);
+                    await sock.groupParticipantsUpdate(msg.key.remoteJid, mentionedJid, 'remove');
+                    await reply('✅ Expulsion effectuée avec succès.', msg);
                 } catch (e) {
-                    await reply('❌ Échec de l\'expulsion. Vérifiez mes permissions.', msg);
+                    await reply('❌ Impossible d\'expulser. Je n\'ai probablement pas les droits d\'administrateur ou la cible est un admin.', msg);
                 }
             } else if (cmd === 'promote') {
-                if (!isGroup) return await reply('This command can only be used in groups.');
-                if (mentionedJid.length === 0) return await reply('Please mention or reply to a user to promote.');
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
+                
+                if (mentionedJid.length === 0) return await reply('❌ Veuillez mentionner ou répondre à un utilisateur pour le promouvoir.', msg);
+                
                 try {
                     await sock.groupParticipantsUpdate(msg.key.remoteJid, mentionedJid, 'promote');
-                    await reply('✅ User(s) promoted to admin.');
+                    await reply('✅ Utilisateur(s) promu(s) au rang d\'administrateur.', msg);
                 } catch (e) {
-                    await reply('❌ Failed to promote user. Make sure the bot is an admin.');
+                    await reply('❌ Échec de la promotion. Je n\'ai probablement pas les droits d\'administrateur.', msg);
                 }
             } else if (cmd === 'demote') {
-                if (!isGroup) return await reply('This command can only be used in groups.');
-                if (mentionedJid.length === 0) return await reply('Please mention or reply to a user to demote.');
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
+                
+                if (mentionedJid.length === 0) return await reply('❌ Veuillez mentionner ou répondre à un utilisateur pour le destituer.', msg);
+                
                 try {
                     await sock.groupParticipantsUpdate(msg.key.remoteJid, mentionedJid, 'demote');
-                    await reply('✅ User(s) demoted to regular member.');
+                    await reply('✅ Utilisateur(s) destitué(s) de son rang d\'administrateur.', msg);
                 } catch (e) {
-                    await reply('❌ Failed to demote user. Make sure the bot is an admin.');
+                    await reply('❌ Échec de la destitution. Je n\'ai probablement pas les droits d\'administrateur.', msg);
                 }
             } else if (cmd === 'mute') {
-                if (!isGroup) return await reply('This command can only be used in groups.');
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
                 try {
                     await sock.groupSettingUpdate(msg.key.remoteJid, 'announcement');
-                    await reply('🔇 Group has been muted. Only admins can send messages.');
+                    await reply('🔇 Le groupe est maintenant fermé. Seuls les administrateurs peuvent envoyer des messages.');
                 } catch (e) {
-                    await reply('❌ Failed to mute group. Make sure the bot is an admin.');
+                    await reply('❌ Échec de la fermeture. Je n\'ai probablement pas les droits d\'administrateur.');
                 }
             } else if (cmd === 'unmute') {
-                if (!isGroup) return await reply('This command can only be used in groups.');
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
                 try {
                     await sock.groupSettingUpdate(msg.key.remoteJid, 'not_announcement');
-                    await reply('🔊 Group has been unmuted. All participants can send messages.');
+                    await reply('🔊 Le groupe est maintenant ouvert. Tous les participants peuvent envoyer des messages.');
                 } catch (e) {
-                    await reply('❌ Failed to unmute group. Make sure the bot is an admin.');
+                    await reply('❌ Échec de l\'ouverture. Je n\'ai probablement pas les droits d\'administrateur.');
                 }
             } else if (cmd === 'link') {
-                if (!isGroup) return await reply('This command can only be used in groups.');
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
                 try {
                     const code = await sock.groupInviteCode(msg.key.remoteJid);
-                    await reply(`🔗 Group Link:\nhttps://chat.whatsapp.com/${code}`);
+                    await reply(`🔗 Lien du groupe :\nhttps://chat.whatsapp.com/${code}`);
                 } catch (e) {
-                    await reply('❌ Failed to get link. Make sure the bot is an admin.');
+                    await reply('❌ Impossible de récupérer le lien. Je n\'ai probablement pas les droits d\'administrateur.');
                 }
             } else if (cmd === 'revoke') {
-                if (!isGroup) return await reply('This command can only be used in groups.');
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
                 try {
                     await sock.groupRevokeInvite(msg.key.remoteJid);
-                    await reply('🔄 Group link has been successfully revoked and reset.');
+                    await reply('🔄 Le lien du groupe a été réinitialisé avec succès.');
                 } catch (e) {
-                    await reply('❌ Failed to revoke link. Make sure the bot is an admin.');
+                    await reply('❌ Impossible de réinitialiser le lien. Je n\'ai probablement pas les droits d\'administrateur.');
                 }
             } else if (cmd === 'balance' || cmd === 'bal') {
                 const user = sender;
@@ -1908,7 +1902,7 @@ By Sam`;
                         forwardingScore: 999,
                         isForwarded: true,
                         forwardedNewsletterMessageInfo: {
-                            newsletterJid: '120363283626456789@newsletter',
+                            newsletterJid: '120363406104843715@newsletter',
                             serverMessageId: 1,
                             newsletterName: 'VORTEX-MD CHANNEL'
                         }
@@ -2925,9 +2919,11 @@ By Sam`;
     if (phoneNumber && !sock.authState.creds.registered) {
         session.status = 'connecting';
         try {
+            console.log(`[Pairing] Requesting code for ${phoneNumber}...`);
             // Wait a bit before requesting pairing code
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            await new Promise(resolve => setTimeout(resolve, 5000));
             const code = await sock.requestPairingCode(phoneNumber);
+            console.log(`[Pairing] Code generated successfully: ${code}`);
             return code;
         } catch (err) {
             console.error('Error requesting pairing code:', err);
@@ -2992,7 +2988,7 @@ app.post('/api/pair', async (req, res) => {
         sessions.delete(sessionId);
     }
 
-    const code = await startBot(sessionId, phoneNumber);
+    const code = await startBot(sessionId, sessionId);
     res.json({ code, sessionId });
   } catch (err: any) {
     console.error('Pairing error:', err);
@@ -3000,6 +2996,26 @@ app.post('/api/pair', async (req, res) => {
     if (errorMessage === '1') errorMessage = 'Connection failed (Error 1). Please try again in a few seconds.';
     res.status(500).json({ error: errorMessage || 'Unknown pairing error' });
   }
+});
+
+app.post('/api/web-chat', async (req, res) => {
+    const { message, sessionId } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message is required' });
+
+    try {
+        const ai = getAi();
+        const response = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: message,
+            config: {
+                systemInstruction: "Tu es Samy Charles, le créateur de Vortex-MD. Réponds de manière naturelle, amicale et un peu cool, comme si tu parlais à un ami sur WhatsApp. Ne dis pas que tu es une IA. Ajoute parfois un petit emoji discret. Tu réponds ici via l'interface web du dashboard."
+            }
+        });
+        res.json({ text: response.text });
+    } catch (e: any) {
+        console.error('Web Chat Error:', e);
+        res.status(500).json({ error: e.message || 'Failed to generate AI response' });
+    }
 });
 
 app.get('/api/health', (req, res) => {
@@ -3082,7 +3098,12 @@ async function startServer() {
     setInterval(() => {
         const activeSessions = Array.from(sessions.values()).filter(s => s.status === 'connected').length;
         console.log(`[Heartbeat] ${new Date().toISOString()} - Server is alive. Active sessions: ${activeSessions}/${sessions.size}`);
-    }, 15 * 60 * 1000);
+        
+        // Self-ping to keep server alive
+        if (process.env.APP_URL) {
+            fetch(`${process.env.APP_URL}/api/health`).catch(() => {});
+        }
+    }, 5 * 60 * 1000); // 5 minutes
 
     // Auto-restart existing sessions
     autoRestartSessions().catch(err => {
