@@ -1718,6 +1718,21 @@ By Sam`;
                 } catch (e) {
                     await reply('❌ Impossible de réinitialiser le lien. Je n\'ai probablement pas les droits d\'administrateur.');
                 }
+            } else if (cmd === 'acceptall') {
+                if (!isGroup) return await reply('❌ Cette commande ne peut être utilisée que dans les groupes.', msg);
+                try {
+                    const response = await sock.groupRequestParticipantsList(msg.key.remoteJid);
+                    if (!response || response.length === 0) {
+                        return await reply('ℹ️ Il n\'y a aucun membre en attente d\'approbation dans ce groupe.');
+                    }
+                    
+                    const jids = response.map((user: any) => user.jid);
+                    await sock.groupRequestParticipantsUpdate(msg.key.remoteJid, jids, 'approve');
+                    await reply(`✅ ${jids.length} membre(s) en attente ont été approuvés avec succès !`);
+                } catch (e) {
+                    console.error('Error in acceptall:', e);
+                    await reply('❌ Impossible d\'approuver les membres. Assurez-vous que le bot est administrateur et que l\'approbation des membres est activée.');
+                }
             } else if (cmd === 'balance' || cmd === 'bal') {
                 const user = sender;
                 if (!economy[user]) economy[user] = { balance: 100, lastDaily: 0 };
